@@ -92,7 +92,7 @@ window.makePeerRoomApi=function(opts){
 }
 html,body{height:100%}
 body{background:var(--night);color:var(--on-dark);font-family:var(--display);overflow:hidden}
-#wrap{position:relative;height:100%;padding-inline:16px;box-sizing:border-box;overflow:hidden}
+#wrap{position:relative;height:100%;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));box-sizing:border-box;overflow:hidden}
 #stage{position:absolute;left:50%;top:50%;width:844px;height:390px;transform-origin:center center;background:var(--stage);border-radius:14px;overflow:hidden;user-select:none;-webkit-user-select:none}
 button{font-family:inherit;cursor:pointer;border:none}
 button:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
