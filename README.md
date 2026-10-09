@@ -6,4 +6,4 @@
 
 - Aynı cihazda sırayla ya da çevrimiçi oda koduyla arkadaşlarla oynanır.
 - Çevrimiçi bağlantı PeerJS ile telefonlar arasında doğrudan kurulur; hesap gerekmez.
-- Tek dosya: `index.html` (Phaser 3 ile çizilen tahta, PeerJS ile oda sistemi).
+- Tek dosya: `index.html` (Three.js ile 3D tahta, PeerJS ile oda sistemi).
