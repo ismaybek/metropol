@@ -26,7 +26,7 @@ window.makePeerRoomApi=function(opts){
     var asHost=!!(o&&o.host);
     return new Promise(function(resolve,reject){
       var peer = asHost ? new Peer(name,opts) : new Peer(undefined,opts);
-      var me=null, conns={}, hostConn=null, peersMap={}, mine={}, hs=[], errHs=[], settled=false, closed=false;
+      var me=null, conns={}, hostConn=null, peersMap={}, mine={}, hs=[], errHs=[], settled=false, closed=false, retries=0;
       function freeze(o){ return Object.freeze(JSON.parse(JSON.stringify(o||{}))); }
       function list(){ return Object.freeze(Object.keys(peersMap).map(function(k){return peersMap[k];})); }
       function fire(j,l,u){ var ps=list(); setTimeout(function(){ hs.forEach(function(h){ try{ h({peers:ps,joined:j||[],left:l||[],updated:u||[]}); }catch(e){} }); },0); }
@@ -34,6 +34,10 @@ window.makePeerRoomApi=function(opts){
       function dropPeer(id){ var o=peersMap[id]; if(o){ delete peersMap[id]; fire([],[o],[]); } }
       function sendAll(msg,except){ Object.keys(conns).forEach(function(id){ if(id!==except){ try{ conns[id].send(msg); }catch(e){} } }); }
       function fail(code){ errHs.forEach(function(h){ try{ h({code:code,message:code}); }catch(e){} }); }
+      function keepAlive(){ if(closed||peer.destroyed) return; if(peer.disconnected){ try{ peer.reconnect(); }catch(e){} } }
+      var ka=setInterval(keepAlive,4000);
+      var vis=function(){ if(!document.hidden){ keepAlive(); if(!asHost && settled && (!hostConn||!hostConn.open)) connectHost(); } };
+      document.addEventListener("visibilitychange",vis);
       var api={ name:name,
         presence:function(patch){ Object.keys(patch||{}).forEach(function(k){ if(patch[k]===null) delete mine[k]; else mine[k]=patch[k]; });
           if(me) setPeer(me,mine);
@@ -44,18 +48,24 @@ window.makePeerRoomApi=function(opts){
         emit:function(){ return Promise.resolve(); }, on:function(){ return function(){}; },
         connected:function(){ return !closed && (asHost || !!(hostConn&&hostConn.open)); },
         onConnection:function(){ return function(){}; },
-        leave:function(){ closed=true; try{ peer.destroy(); }catch(e){} return Promise.resolve(); }
+        leave:function(){ closed=true; clearInterval(ka); document.removeEventListener("visibilitychange",vis); try{ peer.destroy(); }catch(e){} return Promise.resolve(); }
       };
-      peer.on("open",function(id){
-        me=id; setPeer(me,mine);
-        if(asHost){ settled=true; resolve(api); return; }
-        hostConn=peer.connect(name,{reliable:true});
-        hostConn.on("open",function(){ if(!settled){ settled=true; resolve(api); } try{ hostConn.send({k:"pres",p:mine}); }catch(e){} });
-        hostConn.on("data",function(d){ if(!d||typeof d!=="object") return;
+      function connectHost(){
+        if(closed) return;
+        var c=peer.connect(name,{reliable:true}); hostConn=c;
+        c.on("open",function(){ retries=0; if(!settled){ settled=true; resolve(api); } try{ c.send({k:"pres",p:mine}); }catch(e){} });
+        c.on("data",function(d){ if(!d||typeof d!=="object") return;
           if(d.k==="pres" && typeof d.from==="string" && d.from!==me) setPeer(d.from,d.p);
           if(d.k==="bye" && typeof d.from==="string") dropPeer(d.from); });
-        hostConn.on("close",function(){ Object.keys(peersMap).forEach(function(id){ if(id!==me) dropPeer(id); }); fail("upstream_error"); });
-        setTimeout(function(){ if(!settled){ settled=true; reject(new Error("timeout")); try{peer.destroy();}catch(e){} } },12000);
+        c.on("close",function(){ if(c!==hostConn||closed) return;
+          if(retries<15){ retries++; setTimeout(function(){ if(!closed && hostConn===c) connectHost(); },2000); }
+          else { Object.keys(peersMap).forEach(function(id){ if(id!==me) dropPeer(id); }); fail("upstream_error"); } });
+      }
+      peer.on("open",function(id){
+        me=id; setPeer(me,mine);
+        if(asHost){ if(!settled){ settled=true; resolve(api); } return; }
+        if(!hostConn) connectHost();
+        setTimeout(function(){ if(!settled){ settled=true; reject(new Error("timeout")); closed=true; clearInterval(ka); try{peer.destroy();}catch(e){} } },8000);
       });
       if(asHost){
         peer.on("connection",function(c){
@@ -63,13 +73,14 @@ window.makePeerRoomApi=function(opts){
             Object.keys(peersMap).forEach(function(id){ if(id!==c.peer){ try{ c.send({k:"pres",from:id,p:peersMap[id].presence}); }catch(e){} } }); });
           c.on("data",function(d){ if(!d||typeof d!=="object"||d.k!=="pres") return;
             setPeer(c.peer,d.p); sendAll({k:"pres",from:c.peer,p:d.p},c.peer); });
-          c.on("close",function(){ delete conns[c.peer]; dropPeer(c.peer); sendAll({k:"bye",from:c.peer}); });
+          c.on("close",function(){ if(conns[c.peer]!==c) return; delete conns[c.peer]; dropPeer(c.peer); sendAll({k:"bye",from:c.peer}); });
         });
       }
-      peer.on("error",function(e){ var t=e&&e.type;
-        if(!settled){ settled=true; reject(new Error(t||"error")); try{peer.destroy();}catch(_){} return; }
-        if(t==="network"||t==="server-error"||t==="socket-closed") fail("upstream_error"); });
-      peer.on("disconnected",function(){ if(!closed){ try{ peer.reconnect(); }catch(e){} } });
+      peer.on("error",function(e){ var t=(e&&e.type)||"error";
+        if(!settled){ settled=true; closed=true; clearInterval(ka); reject(new Error(t)); try{peer.destroy();}catch(_){} return; }
+        if(t==="peer-unavailable" && !asHost){ return; }
+        if(t==="network"||t==="server-error"||t==="socket-closed"||t==="socket-error") keepAlive(); });
+      peer.on("disconnected",function(){ if(!closed) setTimeout(keepAlive,500); });
     });
   }
   return {join:join};
@@ -702,10 +713,21 @@ async function joinRoom(){
   if(!NET.roomApi) return;
   var code=String(setupState.code||"").replace(/\D/g,"").slice(0,4);
   if(code.length!==4){ toast("4 haneli oda kodunu yaz"); return; }
-  if(NET.joining || NET.nr) return; NET.joining=true; drawSetup();
-  toast("Odaya bağlanılıyor…");
-  var nr; try{ nr=await NET.roomApi.join("metropol-"+code); }catch(e){ NET.joining=false; drawSetup(); toast("Oda bulunamadı. Kodu ve oda sahibinin oyunda beklediğini kontrol et."); return; }
-  NET.joining=false;
+  if(NET.joining || NET.nr) return; NET.joining=true;
+  var nr=null, err=null;
+  for(var at=1; at<=3 && !nr; at++){
+    NET.joinMsg="Bağlanıyor… ("+at+"/3)"; drawSetup();
+    try{ nr=await NET.roomApi.join("metropol-"+code); }catch(e){ err=e; if(at<3) await rsleep(2000); }
+    if(!NET.joining) return;
+  }
+  NET.joining=false; NET.joinMsg="";
+  if(!nr){ var t=err&&err.message||"";
+    var msg = t==="peer-unavailable" ? "Bu kodla açık bir oda bulunamadı. Kodu kontrol et; oda sahibinin oyun ekranı açık olmalı (telefonu kilitlenmiş ya da başka uygulamaya geçmiş olabilir)."
+      : (t==="network"||t==="server-error"||t==="socket-error"||t==="socket-closed") ? "Bağlantı sunucusuna ulaşılamadı. İnternetini kontrol edip tekrar dene."
+      : t==="browser-incompatible" ? "Bu tarayıcı çevrimiçi oyunu desteklemiyor. Chrome ya da Safari ile dene."
+      : "Oda sahibine bağlanılamadı. Oda sahibinin oyun ekranı açıkken tekrar dene.";
+    NET.joinErr=msg; drawSetup(); toast("Bağlanılamadı"); return; }
+  NET.joinErr="";
   NET.nr=nr; NET.role="guest"; NET.code=code;
   nr.presence({r:"guest",nm:cleanName(setupState.names[0])||"Misafir",tk:setupState.tokens[0]}).catch(function(){});
   nr.onPeers(onPeersAny, function(){ toast("Bağlantı koptu"); });
@@ -1964,6 +1986,13 @@ function playerList(form,names,meIdx){
     r.innerHTML='<div class="avatar" style="background:'+COLORS[k]+'">'+(k+1)+'</div><span style="flex:1;font-weight:700;font-size:13px">'+esc(n)+(k===0?' <span style="color:#C9CCD3;font-weight:500">· oda sahibi</span>':'')+(k===meIdx?' <span style="color:#F2B705;font-weight:700">· sen</span>':'')+'</span>';
     form.appendChild(r); });
 }
+function inviteURL(){ return location.origin+location.pathname+"#oda-"+NET.code; }
+function shareInvite(){
+  var url=inviteURL(), text="Metropol odama gel! Oda kodu: "+NET.code;
+  if(navigator.share){ navigator.share({title:"Metropol",text:text,url:url}).catch(function(){}); return; }
+  if(navigator.clipboard&&navigator.clipboard.writeText){ navigator.clipboard.writeText(text+" "+url).then(function(){ toast("Davet linki kopyalandı"); }).catch(function(){ toast(url); }); }
+  else toast(url);
+}
 function drawSetup(){
   var form=NET.form; if(!form) return; form.innerHTML="";
   if(!NET.nr) form.appendChild(segRow("",[["Bu cihazda",false],["Çevrimiçi · arkadaşlarla",true]],setupState.online,function(v){setupState.online=v;}));
@@ -1987,13 +2016,15 @@ function drawSetup(){
     var jr=el("div","srow");
     var ci=el("input"); ci.id="roomcode"; ci.inputMode="numeric"; ci.maxLength=4; ci.placeholder="Oda kodu (4 hane)"; ci.value=setupState.code; ci.setAttribute("aria-label","Oda kodu");
     ci.oninput=function(){ setupState.code=ci.value.replace(/\D/g,"").slice(0,4); if(ci.value!==setupState.code) ci.value=setupState.code; };
-    var jb=el("button","mini go",NET.joining?"Bağlanıyor…":"Odaya katıl"); jb.type="button"; jb.disabled=!!NET.joining; jb.onclick=joinRoom; jr.appendChild(ci); jr.appendChild(jb); form.appendChild(jr);
-    form.appendChild(noteRow("Biri oda kurar, diğerleri 4 haneli kodla katılır. Herkes kendi telefonundan oynar."));
+    var jb=el("button","mini go",NET.joining?(NET.joinMsg||"Bağlanıyor…"):"Odaya katıl"); jb.type="button"; jb.disabled=!!NET.joining; jb.onclick=joinRoom; jr.appendChild(ci); jr.appendChild(jb); form.appendChild(jr);
+    if(NET.joinErr) form.appendChild(el("div","optrow",'<span style="font-weight:700;color:#FFB4A8;line-height:1.4">'+esc(NET.joinErr)+'</span>'));
+    form.appendChild(noteRow("Biri oda kurar, diğerleri 4 haneli kodla ya da davet linkiyle katılır. Oda sahibi, herkes katılana kadar oyun ekranında kalmalı."));
     return;
   }
   if(NET.role==="host"){
     form.appendChild(el("div","optrow",'<span>Oda kodu</span><span style="font-family:var(--mono);font-size:26px;font-weight:700;color:#fff;letter-spacing:.12em">'+esc(NET.code)+'</span>'));
-    form.appendChild(noteRow("Arkadaşların Çevrimiçi › Odaya katıl ile bu kodu yazsın."));
+    if(window.PEERMODE){ var inv=el("button","mini go","Davet linkini paylaş"); inv.type="button"; inv.onclick=shareInvite; var ir=el("div","optrow"); ir.appendChild(inv); ir.appendChild(document.createTextNode(" Linke tıklayan doğrudan katılma ekranına gelir")); form.appendChild(ir); }
+    form.appendChild(noteRow("Arkadaşların Çevrimiçi › Odaya katıl ile bu kodu yazsın. Herkes katılana kadar bu ekranda kal; başka uygulamaya geçersen bağlantı kısa süre kopabilir."));
     playerList(form,(NET.lob&&NET.lob.pl)||[],0);
     var g=(NET.lob&&NET.lob.pl?NET.lob.pl.length:1)-1, maxB=Math.max(0,3-g), bo=[]; for(var b=0;b<=maxB;b++) bo.push([String(b),b]);
     form.appendChild(segRow("Bot",bo,setupState.bots,function(v){setupState.bots=v;}));
@@ -2077,6 +2108,7 @@ $("btnSound").onclick=function(){ muted=!muted; this.textContent="Ses: "+(muted?
 $("btnNew").onclick=function(){ showSetup(); };
 $("btnSpeed").onclick=function(){ SPEED = SPEED===1?0.5:SPEED===0.5?0.25:1; this.textContent="Hız: "+(SPEED===1?"Normal":SPEED===0.5?"Hızlı":"Çok hızlı"); };
 fit(); showSetup();
+(function(){ var m=/^#oda-(\d{4})$/.exec(location.hash||""); if(m && window.PEERMODE){ setupState.online=true; setupState.code=m[1]; drawSetup(); toast("Oda kodu hazır: adını yaz, Odaya katıl'a bas"); } })();
 if(window.PEERMODE && window.Peer && window.makePeerRoomApi){ NET.roomApi=window.makePeerRoomApi(window.PEER_OPTS||{debug:0}); drawSetup(); }
 else try{ if(window.claude && typeof window.claude.use==="function") window.claude.use("room").then(function(r){ NET.roomApi=r; drawSetup(); }).catch(function(){}); }catch(e){}
 })();
