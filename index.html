@@ -1716,7 +1716,7 @@ async function botManage(p){
       if(k==="yes") await execTrade(p,b,[sw.q],[q],0,0); continue; }
     var offer=Math.floor(SQ[q].p*p.greed/10)*10;
     if(p.cash-offer<p.reserve) continue;
-    if(b.bot){ var ask=SQ[q].p*b.ask; if(offer<ask){ if(p.cash-ask>=p.reserve && Math.random()<0.5) offer=Math.ceil(ask/10)*10; else continue; }
+    if(b.bot){ var askP=SQ[q].p*b.ask; if(offer<askP){ if(p.cash-askP>=p.reserve && Math.random()<0.5) offer=Math.ceil(askP/10)*10; else continue; }
       if(Math.random()<b.accept){ await execTrade(p,b,[],[q],offer,0); toast(p.name+", "+b.name+"'den "+SQ[q].s+" aldı"); } }
     else if(!S.asked[p.id+"-"+q]){ S.asked[p.id+"-"+q]=1;
       var k2=await ask(b,{k:"panel",title:p.name+" teklif veriyor",html:p.name+", <b>"+SQ[q].n+"</b> için sana <b>"+fmt(offer)+" jeton</b> teklif ediyor. Satarsan "+G[SQ[q].g].label+" hattını tamamlar.",b:[{key:"no",label:"Reddet"},{key:"yes",label:"Sat · "+fmt(offer),primary:true}]});
@@ -1740,7 +1740,7 @@ function renderTurn(p){
 }
 async function takeTurn(p){
   S.built={}; renderTurn(p); var doubles=0;
-  if(p.bot){ say(p.name+" düşünüyor…"); await wait(500); await botManage(p); }
+  if(p.bot){ say(p.name+" düşünüyor…"); await wait(500); try{ await botManage(p); }catch(e){ console.error(e); } }
   while(!p.out){
     var roll;
     if(p.jail){
