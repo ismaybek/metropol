@@ -17,70 +17,165 @@
 <body>
 <script>window.PEERMODE=true;</script>
 <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
 <script>
 // ---------- PeerJS oda adaptörü (Claude hesabı gerektirmez) ----------
 // room capability ile aynı arayüz: join(name,{host}) -> {presence, peers, onPeers, leave}
+// İki yol: WebRTC (PeerJS, doğrudan) + MQTT aktarıcı (her ağda/iPhone'da çalışır). Oda sahibi ikisini birden dinler.
+window.MQ_URLS=window.MQ_URLS||["wss://broker.hivemq.com:8884/mqtt","wss://broker.emqx.io:8084/mqtt"];
 window.makePeerRoomApi=function(opts){
   opts=opts||{};
-  function join(name,o){
-    var asHost=!!(o&&o.host);
+  var TP="metropol-room-v1/";
+  function mkState(){
+    var st={me:null,peersMap:{},hs:[],errHs:[]};
+    st.freeze=function(o){ return Object.freeze(JSON.parse(JSON.stringify(o||{}))); };
+    st.list=function(){ return Object.freeze(Object.keys(st.peersMap).map(function(k){return st.peersMap[k];})); };
+    st.fire=function(j,l,u){ var ps=st.list(); setTimeout(function(){ st.hs.forEach(function(h){ try{ h({peers:ps,joined:j||[],left:l||[],updated:u||[]}); }catch(e){} }); },0); };
+    st.setPeer=function(id,pres){ var isNew=!st.peersMap[id]; var pe=Object.freeze({peer:id,by:null,isMe:id===st.me,sameTab:id===st.me,kind:"viewer",guest:false,presence:st.freeze(pres),updatedAt:Date.now()}); st.peersMap[id]=pe; st.fire(isNew?[pe]:[],[],isNew?[]:[pe]); };
+    st.dropPeer=function(id){ var o=st.peersMap[id]; if(o){ delete st.peersMap[id]; st.fire([],[o],[]); } };
+    st.fail=function(code){ st.errHs.forEach(function(h){ try{ h({code:code,message:code}); }catch(e){} }); };
+    st.api=function(extra){ var a={ peers:st.list,
+      onPeers:function(h,onErr){ st.hs.push(h); if(onErr) st.errHs.push(onErr); st.fire(st.list(),[],[]); return function(){ st.hs=st.hs.filter(function(x){return x!==h;}); }; },
+      emit:function(){ return Promise.resolve(); }, on:function(){ return function(){}; }, onConnection:function(){ return function(){}; } };
+      for(var k in extra) a[k]=extra[k]; return a; };
+    return st;
+  }
+  function patchInto(mine,patch){ Object.keys(patch||{}).forEach(function(k){ if(patch[k]===null) delete mine[k]; else mine[k]=patch[k]; }); }
+  function mqConnect(url,extra){
+    var o={clientId:"m"+Math.random().toString(36).slice(2,12),keepalive:20,reconnectPeriod:2000,connectTimeout:7000,clean:true};
+    for(var k in extra) o[k]=extra[k];
+    return window.mqtt.connect(url,o);
+  }
+  function parse(m){ try{ var d=JSON.parse(String(m)); return d&&typeof d==="object"?d:null; }catch(e){ return null; } }
+
+  // ---------------- ODA SAHİBİ: WebRTC + MQTT birlikte ----------------
+  function hostJoin(name){
     return new Promise(function(resolve,reject){
-      var peer = asHost ? new Peer(name,opts) : new Peer(undefined,opts);
-      var me=null, conns={}, hostConn=null, peersMap={}, mine={}, hs=[], errHs=[], settled=false, closed=false, retries=0;
-      function freeze(o){ return Object.freeze(JSON.parse(JSON.stringify(o||{}))); }
-      function list(){ return Object.freeze(Object.keys(peersMap).map(function(k){return peersMap[k];})); }
-      function fire(j,l,u){ var ps=list(); setTimeout(function(){ hs.forEach(function(h){ try{ h({peers:ps,joined:j||[],left:l||[],updated:u||[]}); }catch(e){} }); },0); }
-      function setPeer(id,pres){ var isNew=!peersMap[id]; var pe=Object.freeze({peer:id,by:null,isMe:id===me,sameTab:id===me,kind:"viewer",guest:false,presence:freeze(pres),updatedAt:Date.now()}); peersMap[id]=pe; fire(isNew?[pe]:[],[],isNew?[]:[pe]); }
-      function dropPeer(id){ var o=peersMap[id]; if(o){ delete peersMap[id]; fire([],[o],[]); } }
-      function sendAll(msg,except){ Object.keys(conns).forEach(function(id){ if(id!==except){ try{ conns[id].send(msg); }catch(e){} } }); }
-      function fail(code){ errHs.forEach(function(h){ try{ h({code:code,message:code}); }catch(e){} }); }
+      var st=mkState(), mine={}, conns={}, settled=false, closed=false, T=TP+name, mqs=[], mqSeen={}, peerOk=false;
+      st.me=name;
+      var peer=window.Peer?new Peer(name,opts):null;
+      function mqUp(){ return mqs.some(function(c){return c.connected;}); }
+      function mqPub(msg){ var s=JSON.stringify(msg); mqs.forEach(function(c){ if(c.connected){ try{ c.publish(T+"/g",s); }catch(e){} } }); }
+      function sendAll(msg,except){ Object.keys(conns).forEach(function(id){ if(id!==except){ try{ conns[id].send(msg); }catch(e){} } }); mqPub(msg); }
+      function ok(){ if(!settled){ settled=true; st.setPeer(st.me,mine); resolve(api); } }
+      function bad(t){ if(settled) return; settled=true; cleanup(); reject(new Error(t)); }
+      function cleanup(){ closed=true; clearInterval(ka); document.removeEventListener("visibilitychange",vis); try{ peer&&peer.destroy(); }catch(e){} mqs.forEach(function(c){ try{ c.end(true); }catch(e){} }); }
+      function keepAlive(){ if(closed||!peer||peer.destroyed) return; if(peer.disconnected){ try{ peer.reconnect(); }catch(e){} } }
+      var ka=setInterval(function(){ keepAlive(); var now=Date.now(); Object.keys(mqSeen).forEach(function(id){ if(now-mqSeen[id]>20000){ delete mqSeen[id]; st.dropPeer(id); sendAll({k:"bye",from:id}); } }); },4000);
+      var vis=function(){ if(!document.hidden) keepAlive(); };
+      document.addEventListener("visibilitychange",vis);
+      var api=st.api({ name:name,
+        presence:function(patch){ patchInto(mine,patch); st.setPeer(st.me,mine); sendAll({k:"pres",from:st.me,p:mine}); return Promise.resolve(); },
+        connected:function(){ return !closed; },
+        leave:function(){ cleanup(); return Promise.resolve(); } });
+      if(window.mqtt){ window.MQ_URLS.forEach(function(u){
+        var c; try{ c=mqConnect(u,{}); }catch(e){ return; } mqs.push(c);
+        c.on("connect",function(){ c.subscribe(T+"/h"); });
+        c.on("message",function(tp,m){ var d=parse(m); if(!d||typeof d.from!=="string"||d.from===name) return;
+          if(d.k==="hello"){ mqSeen[d.from]=Date.now();
+            Object.keys(st.peersMap).forEach(function(id){ if(id!==d.from){ try{ c.publish(T+"/g",JSON.stringify({k:"pres",from:id,p:st.peersMap[id].presence})); }catch(e){} } });
+            try{ c.publish(T+"/g",JSON.stringify({k:"hi",to:d.from})); }catch(e){} }
+          else if(d.k==="pres"){ mqSeen[d.from]=Date.now(); st.setPeer(d.from,d.p); sendAll({k:"pres",from:d.from,p:d.p},d.from); }
+          else if(d.k==="ping"){ if(st.peersMap[d.from]) mqSeen[d.from]=Date.now(); }
+          else if(d.k==="bye"){ delete mqSeen[d.from]; st.dropPeer(d.from); sendAll({k:"bye",from:d.from}); } });
+      }); }
+      if(peer){
+        peer.on("open",function(){ peerOk=true; ok(); });
+        peer.on("connection",function(c){
+          c.on("open",function(){ conns[c.peer]=c;
+            Object.keys(st.peersMap).forEach(function(id){ if(id!==c.peer){ try{ c.send({k:"pres",from:id,p:st.peersMap[id].presence}); }catch(e){} } }); });
+          c.on("data",function(d){ if(!d||typeof d!=="object"||d.k!=="pres") return;
+            st.setPeer(c.peer,d.p); sendAll({k:"pres",from:c.peer,p:d.p},c.peer); });
+          c.on("close",function(){ if(conns[c.peer]!==c) return; delete conns[c.peer]; st.dropPeer(c.peer); sendAll({k:"bye",from:c.peer}); });
+        });
+        peer.on("error",function(e){ var t=(e&&e.type)||"error";
+          if(t==="unavailable-id" && !settled) return bad("unavailable-id");
+          if(!settled && !peerOk){ if(mqUp()) ok(); return; }
+          if(t==="network"||t==="server-error"||t==="socket-closed"||t==="socket-error") keepAlive(); });
+        peer.on("disconnected",function(){ if(!closed) setTimeout(keepAlive,500); });
+      }
+      // WebRTC sunucusu cevap vermezse aktarıcıyla devam
+      var w=0, wt=setInterval(function(){ w++; if(settled){ clearInterval(wt); return; } if(mqUp() && (w>=6||!peer)) { clearInterval(wt); ok(); } else if(w>=24){ clearInterval(wt); bad("network"); } },500);
+    });
+  }
+
+  // ---------------- MİSAFİR: WebRTC ----------------
+  function rtcGuest(name,ctl){
+    return new Promise(function(resolve,reject){
+      var st=mkState(), peer=new Peer(undefined,opts), hostConn=null, mine={}, settled=false, closed=false, retries=0;
       function keepAlive(){ if(closed||peer.destroyed) return; if(peer.disconnected){ try{ peer.reconnect(); }catch(e){} } }
       var ka=setInterval(keepAlive,4000);
-      var vis=function(){ if(!document.hidden){ keepAlive(); if(!asHost && settled && (!hostConn||!hostConn.open)) connectHost(); } };
+      var vis=function(){ if(!document.hidden){ keepAlive(); if(settled && (!hostConn||!hostConn.open)) connectHost(); } };
       document.addEventListener("visibilitychange",vis);
-      var api={ name:name,
-        presence:function(patch){ Object.keys(patch||{}).forEach(function(k){ if(patch[k]===null) delete mine[k]; else mine[k]=patch[k]; });
-          if(me) setPeer(me,mine);
-          if(asHost) sendAll({k:"pres",from:me,p:mine}); else if(hostConn&&hostConn.open){ try{ hostConn.send({k:"pres",p:mine}); }catch(e){} }
-          return Promise.resolve(); },
-        peers:list,
-        onPeers:function(h,onErr){ hs.push(h); if(onErr) errHs.push(onErr); fire(list(),[],[]); return function(){ hs=hs.filter(function(x){return x!==h;}); }; },
-        emit:function(){ return Promise.resolve(); }, on:function(){ return function(){}; },
-        connected:function(){ return !closed && (asHost || !!(hostConn&&hostConn.open)); },
-        onConnection:function(){ return function(){}; },
-        leave:function(){ closed=true; clearInterval(ka); document.removeEventListener("visibilitychange",vis); try{ peer.destroy(); }catch(e){} return Promise.resolve(); }
-      };
+      function kill(){ closed=true; clearInterval(ka); document.removeEventListener("visibilitychange",vis); try{ peer.destroy(); }catch(e){} }
+      ctl.abort=function(){ if(!settled){ settled=true; kill(); reject(new Error("aborted")); } };
+      var api=st.api({ name:name, via:"rtc",
+        presence:function(patch){ patchInto(mine,patch); if(st.me) st.setPeer(st.me,mine); if(hostConn&&hostConn.open){ try{ hostConn.send({k:"pres",p:mine}); }catch(e){} } return Promise.resolve(); },
+        connected:function(){ return !closed && !!(hostConn&&hostConn.open); },
+        leave:function(){ kill(); return Promise.resolve(); } });
       function connectHost(){
         if(closed) return;
         var c=peer.connect(name,{reliable:true}); hostConn=c;
-        c.on("open",function(){ retries=0; if(!settled){ settled=true; resolve(api); } try{ c.send({k:"pres",p:mine}); }catch(e){} });
+        c.on("open",function(){ retries=0; if(!settled){ settled=true; resolve(api); } if(Object.keys(mine).length){ try{ c.send({k:"pres",p:mine}); }catch(e){} } });
         c.on("data",function(d){ if(!d||typeof d!=="object") return;
-          if(d.k==="pres" && typeof d.from==="string" && d.from!==me) setPeer(d.from,d.p);
-          if(d.k==="bye" && typeof d.from==="string") dropPeer(d.from); });
+          if(d.k==="pres" && typeof d.from==="string" && d.from!==st.me) st.setPeer(d.from,d.p);
+          if(d.k==="bye" && typeof d.from==="string") st.dropPeer(d.from); });
         c.on("close",function(){ if(c!==hostConn||closed) return;
           if(retries<15){ retries++; setTimeout(function(){ if(!closed && hostConn===c) connectHost(); },2000); }
-          else { Object.keys(peersMap).forEach(function(id){ if(id!==me) dropPeer(id); }); fail("upstream_error"); } });
+          else { Object.keys(st.peersMap).forEach(function(id){ if(id!==st.me) st.dropPeer(id); }); st.fail("upstream_error"); } });
       }
-      peer.on("open",function(id){
-        me=id; setPeer(me,mine);
-        if(asHost){ if(!settled){ settled=true; resolve(api); } return; }
-        if(!hostConn) connectHost();
-        setTimeout(function(){ if(!settled){ settled=true; reject(new Error("timeout")); closed=true; clearInterval(ka); try{peer.destroy();}catch(e){} } },8000);
-      });
-      if(asHost){
-        peer.on("connection",function(c){
-          c.on("open",function(){ conns[c.peer]=c;
-            Object.keys(peersMap).forEach(function(id){ if(id!==c.peer){ try{ c.send({k:"pres",from:id,p:peersMap[id].presence}); }catch(e){} } }); });
-          c.on("data",function(d){ if(!d||typeof d!=="object"||d.k!=="pres") return;
-            setPeer(c.peer,d.p); sendAll({k:"pres",from:c.peer,p:d.p},c.peer); });
-          c.on("close",function(){ if(conns[c.peer]!==c) return; delete conns[c.peer]; dropPeer(c.peer); sendAll({k:"bye",from:c.peer}); });
-        });
-      }
+      peer.on("open",function(id){ st.me=id; st.setPeer(id,mine); if(!hostConn) connectHost(); });
       peer.on("error",function(e){ var t=(e&&e.type)||"error";
-        if(!settled){ settled=true; closed=true; clearInterval(ka); reject(new Error(t)); try{peer.destroy();}catch(_){} return; }
-        if(t==="peer-unavailable" && !asHost){ return; }
+        if(!settled){ settled=true; kill(); reject(new Error(t)); return; }
         if(t==="network"||t==="server-error"||t==="socket-closed"||t==="socket-error") keepAlive(); });
       peer.on("disconnected",function(){ if(!closed) setTimeout(keepAlive,500); });
+      setTimeout(function(){ if(!settled){ settled=true; kill(); reject(new Error("timeout")); } },9000);
+    });
+  }
+
+  // ---------------- MİSAFİR: MQTT aktarıcı ----------------
+  function mqGuest(name,ctl){
+    return new Promise(function(resolve,reject){
+      var st=mkState(), id="q"+Math.random().toString(36).slice(2,11), T=TP+name, mine={}, settled=false, closed=false, cs=[], win=null, anyConn=false, pi=null;
+      st.me=id;
+      function kill(){ closed=true; clearInterval(pi); cs.forEach(function(c){ try{ c.end(true); }catch(e){} }); }
+      ctl.abort=function(){ if(!settled){ settled=true; kill(); reject(new Error("aborted")); } };
+      function pub(c,msg){ if(c&&c.connected){ try{ c.publish(T+"/h",JSON.stringify(msg)); }catch(e){} } }
+      var api=st.api({ name:name, via:"mqtt",
+        presence:function(patch){ patchInto(mine,patch); st.setPeer(id,mine); pub(win,{k:"pres",from:id,p:mine}); return Promise.resolve(); },
+        connected:function(){ return !closed && !!(win&&win.connected); },
+        leave:function(){ pub(win,{k:"bye",from:id}); setTimeout(kill,300); return Promise.resolve(); } });
+      window.MQ_URLS.forEach(function(u){
+        var c; try{ c=mqConnect(u,{will:{topic:T+"/h",payload:JSON.stringify({k:"bye",from:id}),qos:0,retain:false}}); }catch(e){ return; } cs.push(c);
+        c.on("connect",function(){ anyConn=true; c.subscribe(T+"/g",function(){ pub(c,{k:"hello",from:id}); if(win===c && Object.keys(mine).length) pub(c,{k:"pres",from:id,p:mine}); }); });
+        c.on("message",function(tp,m){ var d=parse(m); if(!d||closed) return;
+          if(d.k==="hi" && d.to===id && !win){ win=c; cs.forEach(function(o){ if(o!==c){ try{ o.end(true); }catch(e){} } }); cs=[c];
+            st.setPeer(id,mine); pi=setInterval(function(){ pub(win,{k:"ping",from:id}); },5000);
+            if(!settled){ settled=true; resolve(api); } return; }
+          if(c!==win) return;
+          if(d.k==="pres" && typeof d.from==="string" && d.from!==id) st.setPeer(d.from,d.p);
+          if(d.k==="bye" && typeof d.from==="string" && d.from!==id) st.dropPeer(d.from); });
+      });
+      if(!cs.length) return reject(new Error("browser-incompatible"));
+      setTimeout(function(){ if(!settled){ settled=true; kill(); reject(new Error(anyConn?"peer-unavailable":"network")); } },10000);
+    });
+  }
+
+  // ---------------- MİSAFİR: ikisini yarıştır ----------------
+  function join(name,o){
+    if(o&&o.host) return hostJoin(name);
+    return new Promise(function(resolve,reject){
+      var a={}, b={}, done=false, errs=[], n=0, total=0, mqStarted=false, mqTimer=null;
+      function win(api,other){ if(done){ try{ api.leave(); }catch(e){} return; } done=true; clearTimeout(mqTimer); try{ other.abort&&other.abort(); }catch(e){} resolve(api); }
+      function lose(e){ errs.push(e&&e.message||"error"); n++; if(!done && n>=total){ done=true;
+        var pref=["peer-unavailable","network","browser-incompatible"]; reject(new Error(pref.filter(function(x){return errs.indexOf(x)>=0;})[0]||errs[0])); } }
+      function startMq(){ if(mqStarted||done||!window.mqtt) return; mqStarted=true; clearTimeout(mqTimer); total++;
+        mqGuest(name,b).then(function(api){ win(api,a); },function(e){ if(e&&e.message==="aborted") return; lose(e); }); }
+      var useRtc=!window.FORCE_MQTT && !!window.Peer;
+      if(useRtc){ total++;
+        rtcGuest(name,a).then(function(api){ win(api,b); },function(e){ if(e&&e.message==="aborted") return; startMq(); lose(e); }); }
+      if(window.mqtt) mqTimer=setTimeout(startMq, useRtc?2500:0);
+      if(!useRtc && !window.mqtt) reject(new Error("browser-incompatible"));
     });
   }
   return {join:join};
