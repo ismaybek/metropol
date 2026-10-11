@@ -478,7 +478,7 @@ function encSync(){ return {o:S.owner.map(function(x){return x==null?"-":String(
 function decSync(e){ if(!e||typeof e.o!=="string") return; for(var i=0;i<40;i++){ var c=e.o.charAt(i); S.owner[i]=(c==="-"||c==="")?null:(+c); S.lvl[i]=Math.max(0,Math.min(5,+e.l.charAt(i)||0)); S.mort[i]=e.m.charAt(i)==="1"; } S.festival=(typeof e.f==="number"&&e.f>=0&&e.f<40)?e.f:null; }
 function bcSync(){ if(NET.role!=="host"||!NET.started) return; var last=NET.ev[NET.ev.length-1]; if(last&&last.t==="sync") NET.ev.pop(); bc(Object.assign({t:"sync"},encSync())); }
 function snap(){ return {pl:S.players.map(function(p){ return [p.name,COLORS.indexOf(p.color),p.cash,p.pos,p.out?1:0,p.jail?1:0,p.bot?1:0,(typeof p.seat==="string"?p.seat:""),p.jailFree,p.rentFree|0,p.tour?1:0]; }),
-  sy:encSync(), cur:S.cur, r:S.round, fa:S.fast?1:0, ex:S.extra?1:0, sb:S.stockB, st:S.stockT, ov:S.over?{p:S.over.p.id,w:S.over.why}:null}; }
+  sy:encSync(), cur:S.cur, r:S.round, fa:S.fast?1:0, ex:S.extra?1:0, sb:S.stockB, st:S.stockT, bt:Object.keys(S.built||{}), ov:S.over?{p:S.over.p.id,w:S.over.why}:null}; }
 function netPush(){
   if(NET.role!=="host"||!NET.nr) return;
   var o={r:"host",lob:NET.lob};
@@ -540,13 +540,16 @@ function checkAnswers(){
     var pr=pe.presence||{};
     Object.keys(NET.waits).forEach(function(id){ var w=NET.waits[id];
       if(w && pe.peer===w.seat && pr.ans && pr.ans.id===id && validAns(w.spec,pr.ans.v,S.players[w.pid])) w.done(pr.ans.v); });
-    if(NET.started && pr.act && typeof pr.act.id==="number" && pr.act.id>(NET.lastAct[pe.peer]||0)){ NET.lastAct[pe.peer]=pr.act.id; handleAct(pe.peer,pr.act); }
+    if(NET.started && Array.isArray(pr.acts)){
+      pr.acts.forEach(function(a){ if(a && typeof a.id==="number" && a.id>(NET.lastAct[pe.peer]||0)){ NET.lastAct[pe.peer]=a.id; (NET.actQ=NET.actQ||[]).push({peer:pe.peer,a:a}); } });
+      processActs();
+    }
   });
 }
 async function handleAct(peer,a){
   var p=S.players.find(function(x){return x.seat===peer && !x.bot && !x.out;}); if(!p) return;
   var idle=Object.keys(NET.waits).some(function(id){ var w=NET.waits[id]; return w.pid===p.id && w.spec.idle; });
-  if(S.cur!==p.id || !idle || ui.busy) return;
+  if(S.cur!==p.id || !idle){ toast(p.name+": bu işlem sadece kendi turunda, zar atmadan önce ya da tur sonunda yapılabilir"); netPush(); return; }
   var i=a.i|0; ui.busy=true;
   try{
     if(a.t==="build" && canBuild(p,i)) await doBuild(p,i);
@@ -565,7 +568,16 @@ async function handleAct(peer,a){
   } finally { ui.busy=false; }
   netPush();
 }
-function sendAct(a){ if(!NET.nr) return; a.id=++NET.actId; NET.nr.presence({act:a}).catch(function(){}); }
+function sendAct(a){ if(!NET.nr) return; a.id=++NET.actId; NET.acts=(NET.acts||[]).concat([a]).slice(-8); NET.nr.presence({acts:NET.acts}).catch(function(){}); }
+async function processActs(){
+  if(NET.actRunning) return; NET.actRunning=true;
+  try{
+    while(NET.actQ && NET.actQ.length){
+      var guard=0; while(ui.busy && guard++<80) await new Promise(function(r){ setTimeout(r,100); });
+      var it=NET.actQ.shift(); try{ await handleAct(it.peer,it.a); }catch(e){ ui.busy=false; }
+    }
+  } finally { NET.actRunning=false; }
+}
 
 // ---- oda sahibi: oyuncular ----
 function lobbyGuests(){
@@ -579,24 +591,49 @@ function updateLobby(){
   NET.lob={code:NET.code,pl:[cleanName(setupState.names[0])||"Oda sahibi"].concat(g.map(function(x){return x.nm;})),b:setupState.bots};
   netPush(); drawSetup();
 }
+function dropSeat(p,why){
+  if(!p || p.bot || p.out) return;
+  p.bot=true; p.dropped=true; toast(p.name+" "+(why||"ayrıldı")+", yerine bot oynuyor. Aynı adla odaya katılırsa geri döner"); log(p.name+" bağlantısı koptu, bot devraldı");
+  Object.keys(NET.waits).forEach(function(id){ var w=NET.waits[id]; if(w.pid===p.id) w.done(fallbackOf(w.spec)); });
+  netPush();
+}
+function heartbeat(){
+  if(!NET.nr) return;
+  if(NET.role==="guest"){ NET.nr.presence({hb:Date.now()}).catch(function(){}); return; }
+  if(NET.role==="host" && NET.started && S){
+    var ps=NET.nr.peers(), now=Date.now();
+    S.players.forEach(function(p){ if(!isRemote(p)) return; var pe=ps.find(function(x){return x.peer===p.seat;});
+      if(!pe || now-pe.updatedAt>12000) dropSeat(p,"bağlantısı koptu"); });
+  }
+}
+setInterval(heartbeat,3000);
 function hostPeers(ch){
   ch.left.forEach(function(pe){
     var p=S.players.find(function(x){return x.seat===pe.peer && !x.bot;});
-    if(p){ p.bot=true; toast(p.name+" ayrıldı, yerine bot oynuyor"); log(p.name+" bağlantısı koptu, bot devraldı");
-      Object.keys(NET.waits).forEach(function(id){ var w=NET.waits[id]; if(w.pid===p.id) w.done(fallbackOf(w.spec)); });
-      netPush(); }
+    if(p) dropSeat(p,"ayrıldı");
+  });
+  ch.joined.concat(ch.updated||[]).forEach(function(pe){
+    if(pe.sameTab || !pe.presence || pe.presence.r!=="guest") return;
+    if(S.players.some(function(x){ return x.seat===pe.peer && !x.bot; })) return;
+    var nm=cleanName(pe.presence.nm); if(!nm) return;
+    var p=S.players.find(function(x){ return !x.out && x.name===nm && (x.dropped || (typeof x.seat==="string" && x.seat!=="local" && !x.bot)); });
+    if(p){ var wasPrompt=Object.keys(NET.waits).filter(function(id){ return NET.waits[id].pid===p.id; });
+      p.seat=pe.peer; p.bot=false; p.dropped=false;
+      wasPrompt.forEach(function(id){ NET.waits[id].seat=pe.peer; });
+      toast(p.name+" oyuna geri döndü"); log(p.name+" yeniden bağlandı"); netPush(); }
   });
   if(ch.joined.length) netPush();
   checkAnswers();
 }
 async function hostRoom(){
   goFull();
-  if(!NET.roomApi) return;
+  if(!NET.roomApi || NET.joining || NET.nr) return; NET.joining=true;
   var code, nr=null;
   for(var tries=0; tries<3 && !nr; tries++){
     code=String(1000+Math.floor(Math.random()*9000));
     try{ nr=await NET.roomApi.join("metropol-"+code,{host:true}); }catch(e){ nr=null; }
   }
+  NET.joining=false;
   if(!nr){ toast("Oda açılamadı. İnternet bağlantını kontrol edip tekrar dene."); return; }
   NET.nr=nr; NET.role="host"; NET.code=code;
   nr.onPeers(onPeersAny, function(){ toast("Bağlantı koptu"); });
@@ -606,7 +643,7 @@ function hostStart(){
   var g=lobbyGuests(), total=Math.min(4,1+g.length+setupState.bots);
   if(total<2){ toast("En az 2 oyuncu gerekli: arkadaşını bekle ya da bot ekle"); return; }
   var list=[{name:cleanName(setupState.names[0])||"Oda sahibi",seat:"local",bot:false}];
-  g.forEach(function(x){ if(list.length<4) list.push({name:x.nm,seat:x.peer,bot:false}); });
+  g.forEach(function(x){ if(list.length>=4) return; var nm=x.nm, k=2; while(list.some(function(y){return y.name===nm;})) nm=(x.nm.slice(0,10)+" "+(k++)); list.push({name:nm,seat:x.peer,bot:false}); });
   while(list.length<total) list.push({name:"Bot "+list.length,bot:true,seat:null});
   NET.started=true; NET.seq=0; NET.ev=[]; NET.prs={}; NET.waits={};
   startGameWith(list);
@@ -618,8 +655,10 @@ async function joinRoom(){
   if(!NET.roomApi) return;
   var code=String(setupState.code||"").replace(/\D/g,"").slice(0,4);
   if(code.length!==4){ toast("4 haneli oda kodunu yaz"); return; }
+  if(NET.joining || NET.nr) return; NET.joining=true; drawSetup();
   toast("Odaya bağlanılıyor…");
-  var nr; try{ nr=await NET.roomApi.join("metropol-"+code); }catch(e){ toast("Oda bulunamadı. Kodu ve oda sahibinin oyunda beklediğini kontrol et."); return; }
+  var nr; try{ nr=await NET.roomApi.join("metropol-"+code); }catch(e){ NET.joining=false; drawSetup(); toast("Oda bulunamadı. Kodu ve oda sahibinin oyunda beklediğini kontrol et."); return; }
+  NET.joining=false;
   NET.nr=nr; NET.role="guest"; NET.code=code;
   nr.presence({r:"guest",nm:cleanName(setupState.names[0])||"Misafir"}).catch(function(){});
   nr.onPeers(onPeersAny, function(){ toast("Bağlantı koptu"); });
@@ -648,7 +687,8 @@ function onHost(h){
     else { NET.lob=h.lob||null; }
     return;
   }
-  if(h.g) NET.snap=h.g;
+  if(h.g){ NET.snap=h.g;
+    if(NET.me && Array.isArray(h.g.pl)){ var ns=-1; h.g.pl.forEach(function(a,k){ if(String(a[7]||"")===NET.me) ns=k; }); if(ns!==NET.seat){ NET.seat=ns; if(S&&S.players[ns]){ S.players[ns].seat=NET.me; setupChips(); toast("Yerine geri döndün: "+S.players[ns].name); } } } }
   var ev=Array.isArray(h.ev)?h.ev:[];
   if(ev.length && ev[0].s>NET.lastSeq+1){ NET.q=[]; NET.lastSeq=ev[0].s-1; NET.needSnap=true; }
   ev.forEach(function(e){ if(e && typeof e.s==="number" && e.s>NET.lastSeq){ NET.q.push(e); NET.lastSeq=e.s; } });
@@ -674,7 +714,7 @@ function applySnap(g){
     if(!a[4] && p.pos!==(a[3]|0)){ p.pos=(a[3]|0)%40; if(view) view.place(p); }
     if(a[4] && !p.out){ p.out=true; chipOf(p).classList.add("out"); if(view) view.removePawn(p); }
     p.jail=!!a[5]; p.bot=!!a[6]; p.jailFree=a[8]|0; p.rentFree=a[9]|0; p.tour=!!a[10]; });
-  decSync(g.sy); refreshCells(); S.cur=g.cur|0; S.round=g.r|0; S.stockB=g.sb|0; S.stockT=g.st|0;
+  decSync(g.sy); refreshCells(); S.cur=g.cur|0; S.round=g.r|0; S.stockB=g.sb|0; S.stockT=g.st|0; S.built={}; (Array.isArray(g.bt)?g.bt:[]).forEach(function(k){ if(typeof k==='string') S.built[k]=1; });
   S.over=g.ov&&S.players[g.ov.p]?{p:S.players[g.ov.p],why:safe(g.ov.w)}:null;
 }
 var FXOK={pulse:1,markHere:1,confetti:1,coins:1,fireworks:1,buildPop:1,shake:1};
@@ -870,7 +910,9 @@ Board3D.prototype.drawTile=function(i){
   if(ow){ c.strokeStyle=ow.color; c.lineWidth=3.6*k; c.strokeRect(ox+1.8*k,oy+1.8*k,bodyW-3.6*k,bodyH-3.6*k);
     c.fillStyle=ow.color; c.beginPath(); c.moveTo(ox+bodyW,oy+bodyH); c.lineTo(ox+bodyW-11*k,oy+bodyH); c.lineTo(ox+bodyW,oy+bodyH-11*k); c.closePath(); c.fill();
     c.fillStyle="#FFFFFF"; c.font="900 "+(5.6*k)+"px "+FONT; c.textAlign="center"; c.textBaseline="middle"; c.fillText(ow.name.charAt(0).toLocaleUpperCase("tr-TR"),ox+bodyW-3.4*k,oy+bodyH-3.2*k); }
-  var hasPrice=!!(s.p||s.t==="tax"), cx=ox+bodyW/2, cy=oy+bodyH/2;
+  var hasPrice=!!(s.p||s.t==="tax"), cx=ox+bodyW/2, cy=oy+bodyH/2, lv=(S&&s.g)?S.lvl[i]:0;
+  if(lv>0){ if(r.side==="left"){ cx=ox+bodyW*0.70; bodyW=bodyW*0.58; } else if(r.side==="right"){ cx=ox+bodyW*0.30; bodyW=bodyW*0.58; }
+    else if(r.side==="bottom"){ cy=oy+bodyH*0.30; } else if(r.side==="top"){ cy=oy+bodyH*0.70; } }
   c.fillStyle="#14171F"; c.textAlign="center"; c.textBaseline="middle"; c.font="700 "+(8.6*k)+"px "+FONT;
   var name=s.s, tw=c.measureText(name).width, maxw=bodyW-3*k;
   c.save(); c.translate(cx,cy+(hasPrice?-4.6*k:0)); if(tw>maxw) c.scale(maxw/tw,1); c.fillText(name,0,0); c.restore();
@@ -1419,14 +1461,14 @@ async function land(p,roll,opts){
 }
 
 // ---------- Mülk yönetimi ----------
-function canBuild(p,i){ var s=SQ[i]; if(!s.g||S.owner[i]!==p.id||!fullSet(p.id,s.g)) return false; var sq=GSQ[s.g];
+function canBuild(p,i){ var s=SQ[i]; if(!s.g||S.owner[i]!==p.id||!fullSet(p.id,s.g)) return false; if(S.built && S.built[p.id+':'+s.g]) return false; var sq=GSQ[s.g];
   if(sq.some(function(q){return S.mort[q];})) return false; if(S.lvl[i]>=5) return false;
   var min=Math.min.apply(null,sq.map(function(q){return S.lvl[q];})); if(S.lvl[i]>min) return false;
   if(S.lvl[i]===4 && S.stockT<=0) return false; if(S.lvl[i]<4 && S.stockB<=0) return false; return p.cash>=G[s.g].cost; }
 function canSell(p,i){ var s=SQ[i]; if(!s.g||S.owner[i]!==p.id||S.lvl[i]===0) return false; var max=Math.max.apply(null,GSQ[s.g].map(function(q){return S.lvl[q];})); return S.lvl[i]===max; }
 function canMort(p,i){ return S.owner[i]===p.id && !S.mort[i] && !(SQ[i].g && groupBuilt(SQ[i].g)); }
 function canUnmort(p,i){ return S.owner[i]===p.id && S.mort[i] && p.cash>=Math.ceil(SQ[i].p*0.55); }
-async function doBuild(p,i){ var c=G[SQ[i].g].cost; if(S.lvl[i]===4){ S.stockT--; S.stockB+=4; } else S.stockB--; S.lvl[i]++; if(view) view.buildPop(i,S.lvl[i]===5); await transfer(p,null,c); refreshCells(); pulse(i,"stamp"); confetti(i); log(p.name+" "+SQ[i].n+": "+(S.lvl[i]===5?"Transit Merkezi kurdu":S.lvl[i]+". Büfe'yi kurdu")); }
+async function doBuild(p,i){ var c=G[SQ[i].g].cost; if(S.lvl[i]===4){ S.stockT--; S.stockB+=4; } else S.stockB--; S.lvl[i]++; S.built=S.built||{}; S.built[p.id+':'+SQ[i].g]=1; if(view) view.buildPop(i,S.lvl[i]===5); await transfer(p,null,c); refreshCells(); pulse(i,"stamp"); confetti(i); log(p.name+" "+SQ[i].n+": "+(S.lvl[i]===5?"Transit Merkezi kurdu":S.lvl[i]+". Büfe'yi kurdu")); }
 async function doSell(p,i){ var c=G[SQ[i].g].cost/2; if(S.lvl[i]===5){ S.stockT++; S.stockB-=4; } else S.stockB++; S.lvl[i]--; p.cash+=c; setCash(p); floatOn(p,c); refreshCells(); }
 async function doMort(p,i){ S.mort[i]=true; p.cash+=SQ[i].p/2; setCash(p); floatOn(p,SQ[i].p/2); refreshCells(); log(p.name+" "+SQ[i].n+" istasyonunu ipotek etti"); }
 async function doUnmort(p,i){ var c=Math.ceil(SQ[i].p*0.55); S.mort[i]=false; await transfer(p,null,c); refreshCells(); pulse(i,"stamp"); log(p.name+" "+SQ[i].n+" ipoteğini kapattı"); }
@@ -1441,7 +1483,7 @@ function openProps(){
     var s=SQ[i], row=el("div","prow"), col=s.g?G[s.g].c:"#4B5260";
     var lv = s.g?(S.lvl[i]===5?"Transit Merkezi":S.lvl[i]?S.lvl[i]+" Büfe":(fullSet(p.id,s.g)?"Hat tamam":"")):(s.t==="transit"?"Aktarma":"Şirket");
     row.innerHTML='<div class="sw" style="background:'+col+'"></div><div class="pn">'+s.n+'<div class="lv">'+lv+(S.mort[i]?" · ipotekli":"")+'</div></div>';
-    function mk(label,cls,en,fn,act){ var b=el("button","mini "+cls,label); b.type="button"; b.disabled=!en; b.onclick=async function(){ if(NET.role==="guest"){ b.disabled=true; sendAct({t:act,i:i}); return; } if(ui.busy) return; ui.busy=true; await fn(); ui.busy=false; openProps(); }; row.appendChild(b); }
+    function mk(label,cls,en,fn,act){ var b=el("button","mini "+cls,label); b.type="button"; b.disabled=!en; b.onclick=async function(){ if(NET.role==="guest"){ b.disabled=true; sendAct({t:act,i:i}); setTimeout(function(){ if(NET.propsOpen) openProps(); },2500); return; } if(ui.busy) return; ui.busy=true; try{ await fn(); } finally { ui.busy=false; } openProps(); }; row.appendChild(b); }
     if(s.g){ mk("+ "+(S.lvl[i]===4?"Transit":"Büfe")+" "+G[s.g].cost,"go",canBuild(p,i),function(){return doBuild(p,i);},"build"); mk("− Sat","",canSell(p,i),function(){return doSell(p,i);},"sell"); }
     if(S.mort[i]) mk("Kurtar "+Math.ceil(s.p*0.55),"",canUnmort(p,i),function(){return doUnmort(p,i);},"unmort");
     else mk("İpotek +"+s.p/2,"",canMort(p,i),function(){return doMort(p,i);},"mort");
@@ -1488,7 +1530,7 @@ function openTrade(){
       if(!give.length && !get.length && !cg && !cr) return;
       closeModal(); render.cg=render.cr=0;
       if(NET.role==="guest"){ sendAct({t:"trade",to:target.id,give:give.slice(),get:get.slice(),cg:cg,cr:cr}); toast("Teklif gönderildi"); return; }
-      ui.busy=true; await proposeTrade(me,target,give,get,cg,cr); ui.busy=false; refreshSide();
+      ui.busy=true; try{ await proposeTrade(me,target,give,get,cg,cr); } finally { ui.busy=false; } refreshSide();
     };
   }
   render.cg=0; render.cr=0; render();
@@ -1543,7 +1585,7 @@ function renderTurn(p){
   markHere(p.pos);
 }
 async function takeTurn(p){
-  renderTurn(p); var doubles=0;
+  S.built={}; renderTurn(p); var doubles=0;
   if(p.bot){ say(p.name+" düşünüyor…"); await wait(500); await botManage(p); }
   while(!p.out){
     var roll;
@@ -1566,7 +1608,7 @@ async function takeTurn(p){
     } else {
       if(p.tour && !doubles){ p.tour=false; if(await metroTour(p)) break; }
       var bias=null;
-      if(!p.bot) bias=await ask(p,{k:"dice",html:doubles?"<b>Çift attın!</b> Bir kez daha at.":""});
+      if(!p.bot) bias=await ask(p,{k:"dice",idle:true,html:doubles?"<b>Çift attın!</b> Bir kez daha at.":""});
       else await wait(300);
       var dd=await rollDice(bias); roll=dd[0]+dd[1];
       if(dd[0]===dd[1]){ doubles++; if(doubles===3){ toast("Üç kez çift: Kontrolcü!"); await goJail(p); break; } }
@@ -1628,7 +1670,7 @@ function showRules(){
   '<b>Tur:</b> Zarlara dokun ya da basılı tutup göstergeyle kısa / 7 / uzun atış dene. Çift atarsan bir kez daha atarsın; üç kez çift atarsan Arıza Bekleme\'ye gidersin.<br>'+
   '<b>Satın alma:</b> Sahipsiz istasyona düşünce liste fiyatından alabilirsin. Almazsan müzayedeye çıkar.<br>'+
   '<b>Kira:</b> Rakibin istasyonuna düşünce kira ödersin. Hattın tamamı aynı oyuncudaysa temel kira 2 katıdır.<br>'+
-  '<b>İnşa:</b> Hattın tamamı sendeyse Mülklerim\'den Büfe kurarsın (en fazla 4), sonra Transit Merkezi. Bir hattaki Büfe farkı en fazla 1 olabilir.<br>'+
+  '<b>İnşa:</b> Hattın tamamı sendeyse Mülklerim\'den Büfe kurarsın (en fazla 4), sonra Transit Merkezi. Bir hattaki Büfe farkı en fazla 1 olabilir. Her turda bir hatta en fazla 1 bina kurabilirsin.<br>'+
   '<b>Aktarma merkezleri:</b> 1/2/3/4 tane için 20/40/80/160 kira. <b>Şirketler:</b> zar toplamı ×4, ikisi birden ×10.<br>'+
   '<b>Para sıkışırsa:</b> Büfe sat, ipotek et. Yetmezse iflas edersin. Başla\'dan her geçişte 200 alırsın.<br>';
   if(ex) h+='<br><b style="color:#C2410C">Business Tour tarzı kurallar</b><br>'+
@@ -1698,7 +1740,7 @@ function drawSetup(){
     var jr=el("div","srow");
     var ci=el("input"); ci.id="roomcode"; ci.inputMode="numeric"; ci.maxLength=4; ci.placeholder="Oda kodu (4 hane)"; ci.value=setupState.code; ci.setAttribute("aria-label","Oda kodu");
     ci.oninput=function(){ setupState.code=ci.value.replace(/\D/g,"").slice(0,4); if(ci.value!==setupState.code) ci.value=setupState.code; };
-    var jb=el("button","mini go","Odaya katıl"); jb.type="button"; jb.onclick=joinRoom; jr.appendChild(ci); jr.appendChild(jb); form.appendChild(jr);
+    var jb=el("button","mini go",NET.joining?"Bağlanıyor…":"Odaya katıl"); jb.type="button"; jb.disabled=!!NET.joining; jb.onclick=joinRoom; jr.appendChild(ci); jr.appendChild(jb); form.appendChild(jr);
     form.appendChild(noteRow("Biri oda kurar, diğerleri 4 haneli kodla katılır. Herkes kendi telefonundan oynar."));
     return;
   }
