@@ -1577,7 +1577,8 @@ function checkWin(){
 }
 function takeoverPrice(i){ var s=SQ[i]; return 2*(s.p+(s.g?S.lvl[i]*G[s.g].cost:0)); }
 async function maybeTakeover(p,i){
-  var s=SQ[i], o=own(i); if(!S.extra||p.out||!o||o===p||S.lvl[i]===5||S.mort[i]) return;
+  var s=SQ[i], o=own(i); if(!S.extra||p.out||!o||o===p||S.mort[i]) return;
+  if(s.g && groupBuilt(s.g)) return; // binalı hatlar devralınamaz
   var price=takeoverPrice(i); if(p.cash<price) return;
   var yes;
   if(p.bot){ yes = want(p,i)>=1.4 && p.cash-price>=p.reserve+100; await wait(300); }
@@ -1585,6 +1586,18 @@ async function maybeTakeover(p,i){
   if(!yes) return;
   await transfer(p,o,price); S.owner[i]=p.id; sfx.buy(); refreshCells(); pulse(i,"stamp");
   toast(p.name+", "+o.name+"'den "+s.s+" istasyonunu satın aldı"); log(p.name+" "+s.n+" istasyonunu "+fmt(price)+" jetona devraldı"); await wait(600); checkWin();
+}
+function completesWith(p,i){ var s=SQ[i]; if(!s.g) return false; return GSQ[s.g].every(function(q){ return q===i || S.owner[q]===p.id; }); }
+async function mortBuyout(p,i){
+  var s=SQ[i], o=own(i); if(p.out||!o||o===p||!S.mort[i]) return;
+  var line=completesWith(p,i); if(!S.extra && !line) return;
+  var price=s.p, half=Math.floor(price/2); if(p.cash<price) return;
+  var yes;
+  if(p.bot){ yes = (line ? p.cash-price>=Math.min(p.reserve,100) : want(p,i)>=1.2 && p.cash-price>=p.reserve+100); await wait(300); }
+  else yes = (await ask(p,{k:"deed",i:i,hint:"Bu istasyon ipotekli. "+(line?"Hattını tamamlamak için ":"")+"<b>"+fmt(price)+"</b> jetona satın alabilirsin: "+fmt(half)+" "+o.name+"'e, "+fmt(price-half)+" ipoteği kapatmak için bankaya gider. "+o.name+" reddedemez.",b:[{key:"no",label:"Hayır"},{key:"yes",label:"Satın al · "+fmt(price),primary:true}]}))==="yes";
+  if(!yes) return;
+  await transfer(p,o,half); await transfer(p,null,price-half); S.owner[i]=p.id; S.mort[i]=false; if(S.mortR) delete S.mortR[i]; sfx.buy(); refreshCells(); pulse(i,"stamp");
+  toast(p.name+", ipotekli "+s.s+" istasyonunu "+o.name+"'den aldı"); log(p.name+" ipotekli "+s.n+" istasyonunu "+fmt(price)+" jetona satın aldı"+(line?" ve hattını tamamladı":"")); await wait(600); checkWin();
 }
 async function festival(p){
   var mine=S.owner.map(function(o,i){return o===p.id&&SQ[i].t==="prop"&&!S.mort[i]?i:-1;}).filter(function(i){return i>=0;});
@@ -1621,7 +1634,7 @@ async function land(p,roll,opts){
     var o=own(i);
     if(!o) { await offerBuy(p,i); return; }
     if(o===p || o.out) return;
-    if(S.mort[i]){ log(s.n+" ipotekli, kira yok"); return; }
+    if(S.mort[i]){ log(s.n+" ipotekli, kira yok"); await mortBuyout(p,i); return; }
     if(o.jail){ say(o.name+" Arıza Bekleme'de, <b>"+s.n+"</b> için kira alamıyor."); log(o.name+" Arıza Bekleme'de olduğu için kira alamadı ("+s.n+")"); await wait(700); return; }
     if(p.rentFree>0){ p.rentFree--; toast("Gece seferi kartı: kira ödenmedi"); log(p.name+" Gece seferi kartını kullandı"); return; }
     var r=rentOf(i,roll,opts); pulse(i,"flash"); say(p.name+", <b>"+o.name+"</b>'e "+s.n+" için <b>"+fmt(r)+"</b> kira ödüyor.");
@@ -2096,9 +2109,11 @@ function showRules(){
   '<b>İnşa:</b> Hattın tamamı sendeyse Mülklerim\'den Büfe kurarsın (en fazla 4), sonra Transit Merkezi. Bir hattaki Büfe farkı en fazla 1 olabilir. Her turda bir hatta en fazla 1 bina kurabilirsin.<br>'+
   '<b>Aktarma merkezleri:</b> 1/2/3/4 tane için 20/40/80/160 kira. <b>Şirketler:</b> zar toplamı ×4, ikisi birden ×10.<br>'+
   '<b>Para sıkışırsa:</b> Büfe sat, ipotek et (değerinin yarısını alırsın, aynı tutarı ödeyip kurtarırsın). İpotekli istasyon kira getirmez, hat ve aktarma bonusunu bozar; '+MORT_ROUNDS+' tur içinde kurtarılmazsa banka el koyar. Yetmezse iflas edersin. Başla\'dan her geçişte 200 alırsın.<br>'+
+  '<b>İpotekle hat kilitleme olmaz:</b> Hattının geri kalanı sendeyse, o hattaki ipotekli istasyona düşünce onu liste fiyatına alabilirsin (yarısı sahibine, yarısı bankaya).<br>'+
   '<b>Arıza Bekleme:</b> Burada kaldıkça kira alamaz, müzayedeye giremezsin. 50 öde, kart kullan ya da çift at.<br>';
   if(ex) h+='<br><b style="color:#C2410C">Business Tour tarzı kurallar</b><br>'+
-  '<b>Devralma:</b> Rakibin istasyonuna kirayı ödedikten sonra onu değerinin 2 katına satın alabilirsin. Transit Merkezi olan istasyon alınamaz.<br>'+
+  '<b>Devralma:</b> Rakibin istasyonuna kirayı ödedikten sonra onu değerinin 2 katına satın alabilirsin. Büfe ya da Transit Merkezi kurulmuş hattaki istasyonlar devralınamaz.<br>'+
+  '<b>İpotekli istasyon:</b> Üstüne düşersen liste fiyatına satın alabilirsin; yarısı sahibine, yarısı bankaya gider.<br>'+
   '<b>Boğaz Festivali:</b> Bu köşeye düşünce kendi istasyonunu seç; oranın kirası 2 katına çıkar.<br>'+
   '<b>Metro Turu:</b> Bu köşeye düşersen sonraki turunda 50 ödeyip istediğin kareye gidebilirsin.<br>'+
   '<b>Anında kazanma:</b> 3 hattı tamamlayan ya da 4 aktarma merkezinin hepsine sahip olan oyunu kazanır.';
