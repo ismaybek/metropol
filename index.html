@@ -554,7 +554,8 @@ function alive(){ return S.players.filter(function(p){return !p.out;}); }
 function own(i){ return S.owner[i]==null?null:S.players[S.owner[i]]; }
 function fullSet(pid,g){ return GSQ[g].every(function(q){return S.owner[q]===pid;}); }
 function liveSet(pid,g){ return GSQ[g].every(function(q){return S.owner[q]===pid && !S.mort[q];}); }
-function unmortCost(i){ return Math.ceil(SQ[i].p*0.5); }
+function mortAge(i){ var r=S&&S.mortR&&S.mortR[i]; return r?Math.max(0,S.round-r):0; }
+function unmortCost(i){ return Math.round(SQ[i].p*0.5*(1.1+0.1*Math.min(4,mortAge(i)))/5)*5; }
 var MORT_ROUNDS=5;
 function mortLeft(i){ if(!S||!S.mort[i]) return 0; var r=S.mortR&&S.mortR[i]; return r?Math.max(1,MORT_ROUNDS-(S.round-r)):MORT_ROUNDS; }
 function groupBuilt(g){ return GSQ[g].some(function(q){return S.lvl[q]>0;}); }
@@ -1686,7 +1687,7 @@ function canMort(p,i){ return S.owner[i]===p.id && !S.mort[i] && !(SQ[i].g && gr
 function canUnmort(p,i){ return S.owner[i]===p.id && S.mort[i] && p.cash>=unmortCost(i); }
 async function doBuild(p,i){ var c=buildCost(SQ[i].g); stat(p,"built"); if(S.lvl[i]===4){ S.stockT--; S.stockB+=4; } else S.stockB--; S.lvl[i]++; S.built=S.built||{}; S.built[p.id+':'+SQ[i].g]=1; if(view) view.buildPop(i,S.lvl[i]===5); await transfer(p,null,c); refreshCells(); pulse(i,"stamp"); confetti(i); log(p.name+" "+SQ[i].n+": "+(S.lvl[i]===5?"Transit Merkezi kurdu":S.lvl[i]+". Büfe'yi kurdu")); }
 async function doSell(p,i){ var c=G[SQ[i].g].cost/2; if(S.lvl[i]===5){ S.stockT++; S.stockB-=4; } else S.stockB++; S.lvl[i]--; p.cash+=c; setCash(p); floatOn(p,c); refreshCells(); }
-async function doMort(p,i){ S.mort[i]=true; (S.mortR=S.mortR||{})[i]=S.round; p.cash+=SQ[i].p/2; setCash(p); floatOn(p,SQ[i].p/2); refreshCells(); log(p.name+" "+SQ[i].n+" istasyonunu ipotek etti ("+MORT_ROUNDS+" tur içinde kurtarmazsa banka el koyar)"); }
+async function doMort(p,i){ S.mort[i]=true; (S.mortR=S.mortR||{})[i]=S.round; p.cash+=SQ[i].p/2; setCash(p); floatOn(p,SQ[i].p/2); refreshCells(); log(p.name+" "+SQ[i].n+" istasyonunu ipotek etti: +"+fmt(SQ[i].p/2)+". Kurtarma bedeli her tur artar; "+MORT_ROUNDS+" turda kurtarmazsa banka el koyar."); }
 async function doUnmort(p,i){ var c=unmortCost(i); S.mort[i]=false; await transfer(p,null,c); refreshCells(); pulse(i,"stamp"); log(p.name+" "+SQ[i].n+" ipoteğini kapattı"); }
 
 function openProps(){
@@ -2137,7 +2138,7 @@ function showRules(){
   '<b>Kira:</b> Rakibin istasyonuna düşünce kira ödersin. Hattın tamamı aynı oyuncudaysa ve hiçbiri ipotekli değilse temel kira 2 katıdır. Sahibi Arıza Bekleme\'deyse kira alamaz.<br>'+
   '<b>İnşa:</b> Hattın tamamı sendeyse Mülklerim\'den Büfe kurarsın (en fazla 4), sonra Transit Merkezi. Bir hattaki Büfe farkı en fazla 1 olabilir. Her turda bir hatta en fazla 1 bina kurabilirsin.<br>'+
   '<b>Aktarma merkezleri:</b> 1/2/3/4 tane için 20/40/80/160 kira. <b>Şirketler:</b> zar toplamı ×4, ikisi birden ×10.<br>'+
-  '<b>Para sıkışırsa:</b> Büfe sat, ipotek et (değerinin yarısını alırsın, aynı tutarı ödeyip kurtarırsın). İpotekli istasyon kira getirmez, hat ve aktarma bonusunu bozar; '+MORT_ROUNDS+' tur içinde kurtarılmazsa banka el koyar. Yetmezse iflas edersin. Başla\'dan her geçişte 200 alırsın.<br>'+
+  '<b>Para sıkışırsa:</b> Büfe sat, ipotek et (değerinin yarısını alırsın). Kurtarmak için bu tutarın üstüne faiz ödersin: hemen kurtarırsan %10, her geçen tur %10 daha (5. turda %50). İpotekli istasyon kira getirmez, hat ve aktarma bonusunu bozar; '+MORT_ROUNDS+' tur içinde kurtarılmazsa banka el koyar. Yetmezse iflas edersin. Başla\'dan her geçişte 200 alırsın.<br>'+
   '<b>İpotekle hat kilitleme olmaz:</b> Hattının geri kalanı sendeyse, o hattaki ipotekli istasyona düşünce onu liste fiyatına alabilirsin (yarısı sahibine, yarısı bankaya).<br>'+
   '<b>Arıza Bekleme:</b> Burada kaldıkça kira alamaz, müzayedeye giremezsin. 50 öde, kart kullan ya da çift at.<br>';
   if(ex) h+='<br><b style="color:#C2410C">Business Tour tarzı kurallar</b><br>'+
