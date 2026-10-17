@@ -672,6 +672,7 @@ function localAsk(p,spec){
       return askModal(node, btns(spec.b));
     case "panel": var t=el("div","panel",'<h2>'+esc(spec.title||"")+'</h2><div class="ptext">'+safe(spec.html||"")+'</div>'); t.style.width="340px"; return askModal(t, btns(spec.b));
     case "bid": if(!(SQ[spec.i]&&SQ[spec.i].p)) return Promise.resolve(0); return humanBid(p, spec.i);
+    case "raise": return raisePanel(spec);
     case "pick": return pickCell(safe(spec.html||""), (spec.list||[]).filter(function(i){return i>=0&&i<40;}), spec.skip?esc(spec.skip):false);
   }
   return Promise.resolve(null);
@@ -689,6 +690,7 @@ function fallbackOf(spec){
   if(spec.k==="choose"){ var b=(spec.b||[]).filter(function(x){return !x.disabled;})[0]; return b?b.key:null; }
   if(spec.k==="deed") return (spec.b||[]).some(function(x){return x.key==="auc";})?"auc":"no";
   if(spec.k==="panel") return "no"; if(spec.k==="bid") return 0;
+  if(spec.k==="raise") return spec.list[0];
   if(spec.k==="pick") return spec.skip?null:spec.list[0]; return null;
 }
 function validAns(spec,v,p){
@@ -696,6 +698,7 @@ function validAns(spec,v,p){
     case "choose": case "deed": case "panel": return (spec.b||[]).some(function(x){return x.key===v && !x.disabled;});
     case "bid": return typeof v==="number" && v>=0 && v<=p.cash && v%1===0;
     case "pick": return (v===null && !!spec.skip) || (spec.list||[]).indexOf(v)>=0;
+    case "raise": return (spec.list||[]).indexOf(v)>=0;
     case "dice": return v===null||v==="low"||v==="mid"||v==="high";
   }
   return false;
@@ -1350,6 +1353,20 @@ function worth(p){ var w=p.cash; S.owner.forEach(function(o,i){ if(o===p.id){ w+
 
 // ---------- Borç ve iflas ----------
 async function raiseCash(p,need){
+  if(!p.bot){
+    // insan oyuncu: neyi ipotek edeceğini / hangi büfeyi satacağını kendisi seçer
+    var guard=0;
+    while(p.cash<need && guard++<60 && !p.out){
+      var opts=[]; for(var q=0;q<40;q++) if(S.owner[q]===p.id && (canMort(p,q)||canSell(p,q))) opts.push(q);
+      if(!opts.length) return false;
+      var pick=await ask(p,{k:"raise",need:need-p.cash,list:opts,kind:opts.map(function(q){ return canMort(p,q)?"m":"s"; })});
+      if(pick==null || opts.indexOf(pick)<0) pick=opts[0];
+      if(canMort(p,pick)) await doMort(p,pick);
+      else if(canSell(p,pick)){ await doSell(p,pick); log(p.name+" "+SQ[pick].n+" binasını sattı"); }
+      await wait(150);
+    }
+    return p.cash>=need;
+  }
   var mine=S.owner.map(function(o,i){return o===p.id?i:-1;}).filter(function(i){return i>=0;}).sort(function(a,b){return SQ[a].p-SQ[b].p;});
   while(p.cash<need){
     var built=mine.filter(function(i){return S.lvl[i]>0;});
@@ -1607,6 +1624,18 @@ async function festival(p){
   else pick = await ask(p,{k:"pick",html:"<b>Boğaz Festivali!</b> Festivali düzenleyeceğin istasyonu seç. Orada kira, festival başka yere taşınana kadar 2 katına çıkar.",list:mine,skip:false});
   if(pick==null) return;
   S.festival=pick; refreshCells(); pulse(pick,"flash"); if(view) view.fireworks(pick); sfx.win(); toast("Festival "+SQ[pick].n+"'de: kira ×2"); log(p.name+" festivali "+SQ[pick].n+"'e taşıdı"); await wait(700);
+}
+function raisePanel(spec){
+  return new Promise(function(res){
+    var node=el("div","panel"); node.style.width="380px";
+    node.innerHTML='<h2>Para bul</h2><div class="ptext"><b>'+fmt(spec.need|0)+' jeton eksik.</b> Seç: binasız istasyon ipotek edilir, binalı istasyonda bir bina yarı fiyatına satılır.</div>';
+    var box=el("div"); box.style.cssText="display:flex;flex-direction:column;gap:5px;max-height:46vh;overflow:auto;margin-top:8px";
+    (spec.list||[]).forEach(function(i,k){ var s=SQ[i]; if(!s) return; var mort=(spec.kind||[])[k]==="m";
+      var v=mort?Math.floor(s.p/2):(s.g?G[s.g].cost/2:0);
+      var b=el("button","prow",'<div class="sw" style="background:'+(s.g?G[s.g].c:"#4B5260")+'"></div><div class="pn">'+esc(s.n)+'<div class="lv">'+(mort?"İpotek et":"1 bina sat")+'</div></div><span style="font-family:var(--mono);font-weight:700;color:#2E8B57">+'+fmt(v)+'</span>');
+      b.type="button"; b.style.cssText="width:100%;text-align:left;cursor:pointer;color:#14171F;font:inherit;font-weight:700"; b.onclick=function(){ closeModal(); res(i); }; box.appendChild(b); });
+    node.appendChild(box); var sh=el("div","sheet"); sh.appendChild(node); modal(sh);
+  });
 }
 function pickCell(html,list,canSkip){
   return new Promise(function(res){
